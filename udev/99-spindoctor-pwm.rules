@@ -1,0 +1,5 @@
+# Allow PWM control without requiring full root privileges
+# Adjust group as needed (e.g., "users", "adm", "wheel")
+
+SUBSYSTEM=="hwmon", KERNEL=="hwmon*", MODE="0660", GROUP="users"
+SUBSYSTEM=="pwm", MODE="0660", GROUP="users"

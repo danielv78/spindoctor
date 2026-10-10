@@ -1,0 +1,13 @@
+[Unit]
+Description=SpinDoctor Fan Control Service
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/spindoctor
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

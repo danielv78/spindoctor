@@ -1,0 +1,77 @@
+{
+    "temperature_sensors": {
+            "CPU": {
+                 "name": "acpitz_0",
+                 "temp_id": 1,
+                 "crit": "90000",
+                 "min": "40000",
+                 "max": "80000"
+                },
+            "Drive 1": {
+                 "disk": "/dev/disk/by-bay/1",
+                 "temp_id": 1,
+                 "min": "37000",
+                 "max": "45000"
+                 },
+            "Drive 2": {
+                 "disk": "/dev/disk/by-bay/2",
+                 "temp_id": 1,
+                 "min": "37000",
+                 "max": "45000"
+                 },
+            "Drive 3": {
+                 "disk": "/dev/disk/by-bay/3",
+                 "temp_id": 1,
+                 "min": "37000",
+                 "max": "45000"
+                 },
+            "Drive 4": {
+                 "disk": "/dev/disk/by-bay/4",
+                 "temp_id": 1,
+                 "min": "37000",
+                 "max": "45000"
+                 },
+            "Board 1": {
+                 "name": "qnap8528",
+                 "temp_id": 1,
+                 "crit": "60000",
+                 "min": "32000",
+                 "max": "50000"
+                 },
+            "Board 2": {
+                 "name": "qnap8528",
+                 "temp_id": 6,
+                 "crit": "60000",
+                 "min": "32000",
+                 "max": "50000"
+                 },
+            "QM2": {
+                 "name": "qm2",
+                 "temp_id": 1,
+                 "crit": "60000",
+                 "min": "32000",
+                 "max": "50000"
+                 }
+            },
+    "fans": {
+            "main": {
+                 "name": "qnap8528",
+                 "fan_id": 1,
+                 "pwm_id": 1,
+                 "lowest": 0,
+                 "highest": 255
+                },
+            "QM2": {
+                 "name": "qm2",
+                 "fan_id": 1,
+                 "pwm_id": 1,
+                 "lowest": 0,
+                 "highest": 255
+            	}
+        },
+    "relations": {
+            "main": ["CPU", "Drive 1", "Drive 2", "Drive 3", "Drive 4", "Board 1", "Board 2"],
+            "QM2": ["QM2"]
+        }
+}
+

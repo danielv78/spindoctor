@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+########################################################################
+# SpinDoctor – Fan & Temperature Control via Linux hwmon               #
+# Copyright (c) 2024                                                   #
+# Author: Daniel Versick <da-ve@gmx.de>                                #
+#                                                                      #
+# This program is free software: you can redistribute it and/or modify #
+# it under the terms of the GNU General Public License version 3 as    #
+# published by the Free Software Foundation.                           #
+#                                                                      #
+# This program is distributed in the hope that it will be useful,      #
+# but WITHOUT ANY WARRANTY; without even the implied warranty of       #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.                 #
+#                                                                      #
+# You should have received a copy of the GNU General Public License    #
+# along with this program. If not, see:                                #
+# https://www.gnu.org/licenses/gpl-3.0.en.html                         #
+########################################################################
+import json
+import logging
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+HWMON_PATH = Path("/sys/class/hwmon")
+DEFAULT_INTERVAL = 10.0
+CONFIG_PATH = Path("/etc/spindoctor.json")
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stderr)],
+    )
+
+
+# ---------------------------------------------------------------------------
+# SysFS abstraction
+# ---------------------------------------------------------------------------
+
+class SysFS:
+    def __init__(
+        self,
+        base_path: Path,
+        static: Optional[Dict[str, Any]] = None,
+        dynamic: Optional[Dict[str, str]] = None,
+    ) -> None:
+        if static is None:
+            static = {}
+        if dynamic is None:
+            dynamic = {}
+
+        if not base_path.is_dir():
+            raise NotADirectoryError(f"{base_path} is not a valid path")
+
+        self._base_path = base_path
+        self._static = static
+        self._dynamic = dynamic
+
+    def _resolve(self, name: str) -> Optional[Path]:
+        # Static values are not files
+        if name in self._static:
+            return None
+
+        # Map dynamic names to actual sysfs filenames
+        mapped = self._dynamic.get(name, name)
+        file_path = self._base_path / mapped
+
+        if not file_path.is_file():
+            raise AttributeError(f"SysFS element '{mapped}' does not exist")
+
+        return file_path
+
+    def read(self, name: str) -> str:
+        # Return static value if present
+        if name in self._static:
+            return str(self._static[name])
+
+        file_path = self._resolve(name)
+        if file_path is None:
+            raise AttributeError(f"'{name}' is static but not present in static map")
+
+        try:
+            return file_path.read_text().strip()
+        except PermissionError as e:
+            raise PermissionError(f"No read permission for {file_path}") from e
+
+    def write(self, name: str, value: Any) -> None:
+        # Static values cannot be written
+        file_path = self._resolve(name)
+        if file_path is None:
+            raise AttributeError(f"'{name}' is static and cannot be written")
+
+        try:
+            file_path.write_text(str(value))
+        except PermissionError as e:
+            raise PermissionError(f"No write permission for {file_path}") from e
+
+
+# ---------------------------------------------------------------------------
+# Helper functions for hwmon discovery
+# ---------------------------------------------------------------------------
+
+def find_hwmon_by_name(name: str) -> Optional[Path]:
+    # Iterate through all hwmon directories and match by "name" file
+    if not HWMON_PATH.is_dir():
+        logging.error("HWMON base path %s does not exist", HWMON_PATH)
+        return None
+
+    for entry in HWMON_PATH.iterdir():
+        if not entry.is_dir():
+            continue
+        obj = SysFS(entry)
+        try:
+            if obj.read("name") == name:
+                return entry
+        except (AttributeError, OSError) as e:
+            logging.debug("Skipping hwmon entry %s: %s", entry, e)
+            continue
+    return None
+
+
+def get_hwmon_from_disk(disk_path: str) -> Optional[Path]:
+    # Resolve disk path and find associated hwmon directory
+    disk = Path(disk_path)
+
+    if not disk.exists():
+        logging.error("Disk path %s does not exist", disk)
+        return None
+
+    real_device = disk.resolve()
+    kernel_name = real_device.name
+
+    sys_block_path = Path(f"/sys/block/{kernel_name}/device")
+    if not sys_block_path.exists():
+        logging.error("Sysfs path for %s not found", kernel_name)
+        return None
+
+    hwmon_dirs = list(sys_block_path.rglob("hwmon/hwmon*"))
+    if hwmon_dirs:
+        return hwmon_dirs[0]
+
+    logging.error("No hwmon sensor for %s found (is 'drivetemp' loaded?)", kernel_name)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Temperature sensor and fan classes
+# ---------------------------------------------------------------------------
+
+class TempSensor(SysFS):
+    def __init__(
+        self,
+        hwmon: Optional[str] = None,
+        name: Optional[str] = None,
+        disk: Optional[str] = None,
+        temp_id: int = 1,
+        **kwargs: Any,
+    ) -> None:
+        # Resolve hwmon path by name, disk, or explicit path
+        hwmon_path: Optional[Path] = None
+
+        if name:
+            hwmon_path = find_hwmon_by_name(name)
+        elif disk:
+            hwmon_path = get_hwmon_from_disk(disk)
+        elif hwmon:
+            hwmon_path = Path(hwmon)
+
+        if hwmon_path is None:
+            raise RuntimeError("No hwmon path resolved for TempSensor")
+
+        # Map logical names to sysfs filenames
+        dynamic = {
+            "temperature": f"temp{temp_id}_input",
+            "min": f"temp{temp_id}_min",
+            "max": f"temp{temp_id}_max",
+            "crit": f"temp{temp_id}_crit",
+        }
+
+        super().__init__(hwmon_path, static=kwargs, dynamic=dynamic)
+
+
+class Fan(SysFS):
+    def __init__(
+        self,
+        hwmon: Optional[str] = None,
+        name: Optional[str] = None,
+        fan_id: int = 1,
+        pwm_id: int = 1,
+        **kwargs: Any,
+    ) -> None:
+        # Resolve hwmon path by name or explicit path
+        hwmon_path: Optional[Path] = None
+
+        if name:
+            hwmon_path = find_hwmon_by_name(name)
+        elif hwmon:
+            hwmon_path = Path(hwmon)
+
+        if hwmon_path is None:
+            raise RuntimeError(f"Fan device could not be resolved (name={name!r})")
+
+        # Map logical names to sysfs filenames
+        dynamic = {
+            "rpm": f"fan{fan_id}_input",
+            "pwm": f"pwm{pwm_id}",
+        }
+
+        super().__init__(hwmon_path, static=kwargs, dynamic=dynamic)
+
+
+# ---------------------------------------------------------------------------
+# Configuration loading
+# ---------------------------------------------------------------------------
+
+def load_config(path: Path) -> Dict[str, Any]:
+    # Load JSON config and validate required keys
+    if not path.is_file():
+        raise FileNotFoundError(f"Config file {path} not found")
+
+    with path.open() as f:
+        config = json.load(f)
+
+    for key in ("temperature_sensors", "fans", "relations"):
+        if key not in config:
+            raise KeyError(f"Missing required config key: {key}")
+
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Device construction
+# ---------------------------------------------------------------------------
+
+def build_devices(config: Dict[str, Any]) -> tuple[Dict[str, TempSensor], Dict[str, Fan]]:
+    # Create TempSensor and Fan objects from config, skipping devices that
+    # fail to initialize so one bad sensor/fan doesn't take down the whole controller
+    temp_sensors: Dict[str, TempSensor] = {}
+    for name, cfg in config["temperature_sensors"].items():
+        try:
+            temp_sensors[name] = TempSensor(**cfg)
+        except Exception as e:
+            logging.warning("Temperature sensor %s could not be found: %s", name, e)
+
+    fans: Dict[str, Fan] = {}
+    for name, cfg in config["fans"].items():
+        try:
+            fans[name] = Fan(**cfg)
+        except Exception as e:
+            logging.warning("Fan %s could not be found: %s", name, e)
+
+    return temp_sensors, fans
+
+
+# ---------------------------------------------------------------------------
+# Control loop
+# ---------------------------------------------------------------------------
+
+def control_loop(config: Dict[str, Any]) -> None:
+    temp_sensors, fans = build_devices(config)
+
+    while True:
+        sleep_time = DEFAULT_INTERVAL
+
+        # Read every configured sensor once per iteration; a sensor that cannot be
+        # read yields no reading (and a warning) for this round.
+        readings: Dict[str, tuple] = {}
+        for sensor_name, sensor in temp_sensors.items():
+            try:
+                temp = int(sensor.read("temperature"))
+                mint = int(sensor.read("min"))
+                maxt = int(sensor.read("max"))
+            except (AttributeError, OSError, ValueError) as e:
+                logging.warning("Temperature sensor %s could not be read: %s", sensor_name, e)
+                continue
+            readings[sensor_name] = (temp, mint, maxt)
+
+        no_temp_sensors_available = not readings
+        if no_temp_sensors_available:
+            logging.warning(
+                "No configured temperature sensor could be found or read; "
+                "setting all fans to maximum speed"
+            )
+            sleep_time = 1
+
+        for fan_name in config["relations"]:
+            if fan_name not in fans:
+                logging.error("Fan %s in relations not defined in config['fans']", fan_name)
+
+        any_fan_written = False
+
+        for fan_name, fan in fans.items():
+            try:
+                fanhigh = int(fan.read("highest"))
+                fanlow = int(fan.read("lowest"))
+            except (AttributeError, OSError, ValueError) as e:
+                logging.warning("Fan %s could not be read: %s", fan_name, e)
+                continue
+
+            if no_temp_sensors_available:
+                pwm_all = fanhigh
+            else:
+                sensor_names = config["relations"].get(fan_name)
+                if sensor_names is None:
+                    continue
+
+                pwm_all = 0
+                have_reading = False
+                for sensor_name in sensor_names:
+                    reading = readings.get(sensor_name)
+                    if reading is None:
+                        if sensor_name not in temp_sensors:
+                            logging.error(
+                                "Sensor %s in relations not defined in config['temperature_sensors']",
+                                sensor_name,
+                            )
+                        continue
+
+                    temp, mint, maxt = reading
+                    have_reading = True
+
+                    # Validate temperature range
+                    if maxt <= mint:
+                        logging.error("Invalid temperature range for sensor %s: min=%s max=%s",
+                                      sensor_name, mint, maxt)
+                        continue
+
+                    # Compute PWM value
+                    if temp <= mint:
+                        pwm_val = fanlow
+                    elif temp >= maxt:
+                        pwm_val = fanhigh
+                        sleep_time = 1
+                    else:
+                        pwm_per_degree = (fanhigh - fanlow) / (maxt - mint)
+                        pwm_val = int(fanlow + pwm_per_degree * (temp - mint))
+                        s = (1 - (temp - mint) / (maxt - mint)) * DEFAULT_INTERVAL
+                        sleep_time = min(sleep_time, s)
+
+                    pwm_all = max(pwm_all, pwm_val)
+
+                if not have_reading:
+                    logging.warning(
+                        "No usable temperature reading for fan %s; "
+                        "failing safe to maximum speed", fan_name,
+                    )
+                    pwm_all = fanhigh
+                    sleep_time = 1
+
+            try:
+                fan.write("pwm", pwm_all)
+                any_fan_written = True
+            except (AttributeError, OSError) as e:
+                logging.warning("Fan %s could not be written: %s", fan_name, e)
+
+        if not any_fan_written:
+            logging.error(
+                "No configured fan could be found or written to; fan control inactive"
+            )
+
+        time.sleep(sleep_time)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def _handle_sigterm(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt()
+
+
+def main() -> None:
+    setup_logging()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    try:
+        config = load_config(CONFIG_PATH)
+    except Exception as e:
+        logging.critical("Failed to load config: %s", e)
+        sys.exit(1)
+
+    try:
+        control_loop(config)
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user, exiting.")
+    except Exception as e:
+        logging.exception("Unhandled exception in control loop: %s", e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+

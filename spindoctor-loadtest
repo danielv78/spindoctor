@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+########################################################################
+# SpinDoctor Load Test – stresses the CPU(s) and checks whether the    #
+# PWM value of the configured fans rises in response.                  #
+#                                                                       #
+# This is a black-box smoke test: it assumes a spindoctor daemon (or   #
+# some other controller) is already running against the same hwmon    #
+# devices and reacting to temperature changes. This tool only stresses #
+# the CPU and observes PWM values, it does not control any fan itself. #
+########################################################################
+import argparse
+import importlib.util
+import logging
+import multiprocessing
+import signal
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from typing import Dict, Optional
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SPINDOCTOR_PATH = SCRIPT_DIR / "spindoctor"
+DEFAULT_CONFIG = Path("/etc/spindoctor.json")
+DEFAULT_DURATION = 30.0
+SAMPLE_INTERVAL = 1.0
+
+
+def load_spindoctor_module():
+    loader = SourceFileLoader("spindoctor_lib", str(SPINDOCTOR_PATH))
+    spec = importlib.util.spec_from_loader("spindoctor_lib", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def cpu_burn(stop_time: float) -> None:
+    # Ignore Ctrl-C in the worker; the parent handles shutdown.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    x = 0.0001
+    while time.monotonic() < stop_time:
+        x = (x * 1.0000001 + 1.0) % 1e9
+
+
+def stress_cpus(duration: float) -> list:
+    # Use "fork" explicitly: it needs no pickling of the worker function and
+    # is available on every platform this tool is meant to run on (Linux).
+    ctx = multiprocessing.get_context("fork")
+    cpu_count = multiprocessing.cpu_count()
+    stop_time = time.monotonic() + duration
+    procs = [
+        ctx.Process(target=cpu_burn, args=(stop_time,), daemon=True)
+        for _ in range(cpu_count)
+    ]
+    for p in procs:
+        p.start()
+    return procs
+
+
+def read_pwm(fan_name: str, fan) -> Optional[int]:
+    try:
+        return int(fan.read("pwm"))
+    except Exception as e:
+        logging.warning("Could not read PWM for fan '%s': %s", fan_name, e)
+        return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Stress the CPU(s) and check whether configured fan PWM values rise."
+    )
+    parser.add_argument("-c", "--config", type=Path, default=DEFAULT_CONFIG,
+                         help="Path to spindoctor config (default: %(default)s)")
+    parser.add_argument("-d", "--duration", type=float, default=DEFAULT_DURATION,
+                         help="Maximum test duration in seconds (default: %(default)s)")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    sd = load_spindoctor_module()
+
+    try:
+        config = sd.load_config(args.config)
+    except Exception as e:
+        logging.error("Could not load config %s: %s", args.config, e)
+        return 1
+
+    _, fans = sd.build_devices(config)
+    if not fans:
+        logging.error("No fans could be resolved from config; cannot run test")
+        return 1
+
+    baseline: Dict[str, Optional[int]] = {}
+    for name, fan in fans.items():
+        val = read_pwm(name, fan)
+        baseline[name] = val
+        logging.info("Baseline PWM for fan '%s': %s", name, val)
+
+    if all(v is None for v in baseline.values()):
+        logging.error("PWM value of no configured fan could be read; cannot run test")
+        return 1
+
+    cpu_count = multiprocessing.cpu_count()
+    logging.info("Stressing %d CPU core(s) for up to %.0fs ...", cpu_count, args.duration)
+    procs = stress_cpus(args.duration)
+
+    peak: Dict[str, Optional[int]] = dict(baseline)
+    deadline = time.monotonic() + args.duration
+    try:
+        while time.monotonic() < deadline:
+            time.sleep(SAMPLE_INTERVAL)
+            for name, fan in fans.items():
+                val = read_pwm(name, fan)
+                if val is None:
+                    continue
+                if peak[name] is None or val > peak[name]:
+                    peak[name] = val
+                logging.info("Fan '%s' PWM=%s", name, val)
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+
+    increased = [
+        name for name in fans
+        if baseline[name] is not None and peak[name] is not None and peak[name] > baseline[name]
+    ]
+
+    print()
+    for name in fans:
+        print(f"  Fan '{name}': baseline={baseline[name]} peak={peak[name]}")
+    print()
+
+    if increased:
+        print(f"POSITIV: PWM-Wert(e) gestiegen bei Fan(s): {', '.join(increased)}")
+        return 0
+
+    print("NEGATIV: Keine Erhoehung der PWM-Werte waehrend der CPU-Last erkannt")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
