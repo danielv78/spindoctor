@@ -59,6 +59,7 @@ sudo make install
 This installs:
 
 - `spindoctor` → `/usr/local/sbin/spindoctor`
+- `spindoctor-loadtest` → `/usr/local/sbin/spindoctor-loadtest`
 - `config/qnap-ts-453d.json` → `/etc/spindoctor.json` (edit this for your hardware, see below)
 - `systemd/spindoctor.service` → `/etc/systemd/system/spindoctor.service`
 - `udev/99-spindoctor-pwm.rules` → `/etc/udev/rules.d/99-spindoctor-pwm.rules`
@@ -263,7 +264,8 @@ This example is known to work on a QNAP TS-453D with the following two kernel dr
 Run it (usually as root, since reading `pwm*` may otherwise be restricted):
 
 ```bash
-sudo ./spindoctor-loadtest
+sudo spindoctor-loadtest      # installed via make install
+sudo ./spindoctor-loadtest    # from the repository checkout
 ```
 
 Options:

@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import logging
 import multiprocessing
+import shutil
 import signal
 import sys
 import time
@@ -20,14 +21,32 @@ from pathlib import Path
 from typing import Dict, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-SPINDOCTOR_PATH = SCRIPT_DIR / "spindoctor"
+INSTALLED_SPINDOCTOR = Path("/usr/local/sbin/spindoctor")
 DEFAULT_CONFIG = Path("/etc/spindoctor.json")
 DEFAULT_DURATION = 30.0
 SAMPLE_INTERVAL = 1.0
 
 
+def find_spindoctor() -> Path:
+    # Prefer the spindoctor executable found via PATH (installed system),
+    # then the default install location (may be missing from PATH for
+    # non-root users), then a copy next to this script (repo checkout).
+    found = shutil.which("spindoctor")
+    candidates = [Path(found)] if found else []
+    candidates += [INSTALLED_SPINDOCTOR, SCRIPT_DIR / "spindoctor"]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "spindoctor executable not found in PATH, at %s or in %s"
+        % (INSTALLED_SPINDOCTOR, SCRIPT_DIR)
+    )
+
+
 def load_spindoctor_module():
-    loader = SourceFileLoader("spindoctor_lib", str(SPINDOCTOR_PATH))
+    spindoctor_path = find_spindoctor()
+    logging.debug("Using spindoctor from %s", spindoctor_path)
+    loader = SourceFileLoader("spindoctor_lib", str(spindoctor_path))
     spec = importlib.util.spec_from_loader("spindoctor_lib", loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -80,7 +99,11 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    sd = load_spindoctor_module()
+    try:
+        sd = load_spindoctor_module()
+    except FileNotFoundError as e:
+        logging.error("%s", e)
+        return 1
 
     try:
         config = sd.load_config(args.config)
